@@ -17,9 +17,11 @@ type MsgType byte
 
 const (
 	MsgHandshake MsgType = iota
-	MsgPing
-	MsgPong
+	MsgHeartbeat
+	MsgHeartbeatAck
 	MsgData
+	MsgElection
+	MsgCoordinator
 )
 
 type Handshake struct {

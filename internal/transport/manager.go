@@ -1,20 +1,14 @@
 package transport
 
 import (
-	"context"
+	"encoding/json"
 	"log"
 	"net"
 	"sync"
 	"time"
 )
 
-const (
-	dialInitialBackoff = 1 * time.Second
-	dialMaxBackoff     = 60 * time.Second
-	probeInterval      = 10 * time.Second
-	handshakeTimeout   = 5 * time.Second
-	maxFailedAttempts  = 3
-)
+const handshakeTimeout = 5 * time.Second
 
 type Peer struct {
 	NodeID string
@@ -22,18 +16,23 @@ type Peer struct {
 }
 
 type peerState struct {
-	addr           string
-	conn           *Conn
-	backoff        time.Duration
-	lastDialed     time.Time
-	failedAttempts int
+	addr string
+	conn *Conn
 }
+
+type MessageHandler func(from string, msgType MsgType, payload []byte)
+type PeerCallback func(nodeID string)
 
 type Manager struct {
 	ourNodeID     string
 	ourListenPort int
 	peers         map[string]*peerState
 	mu            sync.RWMutex
+
+	onMessage   MessageHandler
+	onPeerAdded PeerCallback
+	onPeerLost  PeerCallback
+	onData      MessageHandler
 }
 
 func NewManager(ourNodeID string, ourListenPort int) *Manager {
@@ -44,16 +43,33 @@ func NewManager(ourNodeID string, ourListenPort int) *Manager {
 	}
 }
 
+func (m *Manager) SetMessageHandler(h MessageHandler) {
+	m.onMessage = h
+}
+
+func (m *Manager) SetPeerCallbacks(onAdded, onLost PeerCallback) {
+	m.onPeerAdded = onAdded
+	m.onPeerLost = onLost
+}
+
+func (m *Manager) SetDataHandler(h MessageHandler) {
+	m.onData = h
+}
+
 func (m *Manager) AddPeer(peer Peer) {
-	if peer.NodeID == "" {
+	if peer.NodeID == "" || peer.NodeID == m.ourNodeID {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ps := m.getOrCreate(peer.NodeID, peer.Addr)
 	if ps.addr != peer.Addr {
-		log.Printf("peer %s changed address: %s -> %s", peer.NodeID, ps.addr, peer.Addr)
+		log.Printf("[transport] peer %s changed address: %s -> %s", peer.NodeID, ps.addr, peer.Addr)
 		ps.addr = peer.Addr
+	}
+
+	if ps.conn == nil && m.ourNodeID < peer.NodeID {
+		go m.connectToPeer(peer)
 	}
 }
 
@@ -61,12 +77,56 @@ func (m *Manager) getOrCreate(nodeID, addr string) *peerState {
 	if ps, ok := m.peers[nodeID]; ok {
 		return ps
 	}
-	ps := &peerState{addr: addr, backoff: dialInitialBackoff}
+	ps := &peerState{addr: addr}
 	m.peers[nodeID] = ps
+	if m.onPeerAdded != nil {
+		go m.onPeerAdded(nodeID)
+	}
 	return ps
 }
 
+func (m *Manager) connectToPeer(peer Peer) {
+	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	raw, err := dialer.Dial("tcp", peer.Addr)
+	if err != nil {
+		log.Printf("[transport] dial %s (%s): %v", peer.Addr, peer.NodeID, err)
+		return
+	}
+	wrapped := NewConn(raw)
+	_ = raw.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err := wrapped.WriteHandshake(Handshake{NodeID: m.ourNodeID, ListenPort: m.ourListenPort}); err != nil {
+		_ = wrapped.Close()
+		log.Printf("[transport] handshake write to %s: %v", peer.NodeID, err)
+		return
+	}
+	if _, err := wrapped.ReadHandshake(); err != nil {
+		_ = wrapped.Close()
+		log.Printf("[transport] handshake read from %s: %v", peer.NodeID, err)
+		return
+	}
+	_ = raw.SetDeadline(time.Time{})
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ps, ok := m.peers[peer.NodeID]
+	if !ok {
+		_ = wrapped.Close()
+		return
+	}
+	if ps.conn != nil {
+		_ = wrapped.Close()
+		return
+	}
+	ps.conn = wrapped
+	go m.readLoop(peer.NodeID, wrapped)
+	log.Printf("[transport] established outbound connection to %s", peer.NodeID)
+}
+
 func (m *Manager) RegisterIncoming(conn *Conn, peerAddr, nodeID string) {
+	if nodeID == "" || nodeID == m.ourNodeID {
+		_ = conn.Close()
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ps := m.getOrCreate(nodeID, peerAddr)
@@ -74,173 +134,85 @@ func (m *Manager) RegisterIncoming(conn *Conn, peerAddr, nodeID string) {
 		_ = ps.conn.Close()
 	}
 	ps.conn = conn
-	ps.failedAttempts = 0
 	go m.readLoop(nodeID, conn)
-	log.Printf("accepted connection from %s (%s)", peerAddr, nodeID)
+	log.Printf("[transport] accepted connection from %s (%s)", peerAddr, nodeID)
 }
 
 func (m *Manager) readLoop(nodeID string, c *Conn) {
-	log.Printf("read loop started for %s", nodeID)
+	log.Printf("[transport] read loop started for %s", nodeID)
 	defer func() {
-		log.Printf("read loop ended for %s", nodeID)
+		log.Printf("[transport] read loop ended for %s", nodeID)
+		_ = c.Close()
 		m.mu.Lock()
-		if ps, ok := m.peers[nodeID]; ok {
+		if ps, ok := m.peers[nodeID]; ok && ps.conn == c {
 			ps.conn = nil
-			_ = c.Close()
-			if m.ourNodeID > nodeID {
-				delete(m.peers, nodeID)
-				log.Printf("evicted peer %s (passive side, connection lost)", nodeID)
-			}
+			delete(m.peers, nodeID)
 		}
 		m.mu.Unlock()
+		if m.onPeerLost != nil {
+			m.onPeerLost(nodeID)
+		}
 	}()
+
 	for {
-		t, _, err := c.ReadMessage()
+		t, payload, err := c.ReadMessage()
 		if err != nil {
-			log.Printf("read error from %s: %v", nodeID, err)
+			log.Printf("[transport] read error from %s: %v", nodeID, err)
 			return
 		}
-		if t == MsgPing {
-			log.Printf("received ping from %s, sending pong", nodeID)
-			_ = c.WriteMessage(MsgPong, nil)
-		}
-	}
-}
 
-func (m *Manager) RunHealthCheck(ctx context.Context) {
-	log.Printf("health check loop started (interval: %v)", probeInterval)
-	ticker := time.NewTicker(probeInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("health check loop stopping: context cancelled")
-			return
-		case <-ticker.C:
-			m.probePeers()
-		}
-	}
-}
-
-func (m *Manager) probePeers() {
-	m.mu.RLock()
-	peers := make([]Peer, 0, len(m.peers))
-	for id, ps := range m.peers {
-		peers = append(peers, Peer{NodeID: id, Addr: ps.addr})
-	}
-	m.mu.RUnlock()
-	log.Printf("probing %d peer(s)", len(peers))
-
-	for _, p := range peers {
-		m.probeOne(p)
-	}
-}
-
-func (m *Manager) probeOne(peer Peer) {
-	// Lower NodeID dials to prevent duplicate connections between peers.
-	if m.ourNodeID >= peer.NodeID {
-		log.Printf("skipping probe to %s: higher NodeID (ours=%s, theirs=%s)", peer.NodeID, m.ourNodeID, peer.NodeID)
-		return
-	}
-
-	m.mu.RLock()
-	ps, ok := m.peers[peer.NodeID]
-	if !ok {
-		m.mu.RUnlock()
-		log.Printf("peer %s no longer exists, skipping probe", peer.NodeID)
-		return
-	}
-	conn, lastDial, bo := ps.conn, ps.lastDialed, ps.backoff
-	m.mu.RUnlock()
-
-	if conn != nil {
-		log.Printf("sending ping to %s", peer.NodeID)
-		_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
-		err := conn.WriteMessage(MsgPing, nil)
-		_ = conn.SetDeadline(time.Time{})
-		if err != nil {
-			log.Printf("ping failed for %s: %v", peer.NodeID, err)
-			_ = conn.Close()
-			m.mu.Lock()
-			if ps, ok := m.peers[peer.NodeID]; ok && ps.conn == conn {
-				ps.conn = nil
+		switch t {
+		case MsgHeartbeat:
+			ackPayload, _ := json.Marshal(struct{}{})
+			_ = c.WriteMessage(MsgHeartbeatAck, ackPayload)
+			if m.onMessage != nil {
+				m.onMessage(nodeID, t, payload)
 			}
-			m.mu.Unlock()
-			m.markFailure(peer.NodeID)
-		} else {
-			log.Printf("ping succeeded to %s", peer.NodeID)
+		case MsgElection, MsgCoordinator:
+			if m.onMessage != nil {
+				m.onMessage(nodeID, t, payload)
+			}
+		case MsgData:
+			if m.onData != nil {
+				m.onData(nodeID, t, payload)
+			}
 		}
-		return
 	}
-
-	if time.Since(lastDial) < bo {
-		log.Printf("backing off dial to %s (waited %v, need %v)", peer.NodeID, time.Since(lastDial), bo)
-		return
-	}
-
-	log.Printf("attempting dial to %s (%s)", peer.Addr, peer.NodeID)
-
-	m.mu.Lock()
-	ps.lastDialed = time.Now()
-	m.mu.Unlock()
-
-	newConn, err := m.dial(peer)
-	if err != nil {
-		log.Printf("dial %s (%s): %v", peer.Addr, peer.NodeID, err)
-		m.markFailure(peer.NodeID)
-		return
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ps, ok = m.peers[peer.NodeID]
-	if !ok || ps.conn != nil {
-		_ = newConn.Close()
-		return
-	}
-	ps.conn = newConn
-	ps.backoff = dialInitialBackoff
-	ps.failedAttempts = 0
-	go m.readLoop(peer.NodeID, newConn)
-	log.Printf("established outbound connection to %s", peer.NodeID)
 }
 
-func (m *Manager) dial(peer Peer) (*Conn, error) {
-	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	raw, err := dialer.Dial("tcp", peer.Addr)
-	if err != nil {
-		return nil, err
-	}
-	wrapped := NewConn(raw)
-	_ = raw.SetDeadline(time.Now().Add(handshakeTimeout))
-	if err := wrapped.WriteHandshake(Handshake{NodeID: m.ourNodeID, ListenPort: m.ourListenPort}); err != nil {
-		_ = wrapped.Close()
-		return nil, err
-	}
-	if _, err := wrapped.ReadHandshake(); err != nil {
-		_ = wrapped.Close()
-		return nil, err
-	}
-	_ = raw.SetDeadline(time.Time{})
-	return wrapped, nil
-}
-
-func (m *Manager) markFailure(nodeID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ps, ok := m.peers[nodeID]
-	if !ok {
-		return
-	}
-	ps.failedAttempts++
-	ps.backoff = min(ps.backoff*2, dialMaxBackoff)
-	if ps.failedAttempts >= maxFailedAttempts {
-		log.Printf("evicting peer %s after %d failed probes", nodeID, maxFailedAttempts)
+func (m *Manager) Broadcast(msgType MsgType, payload []byte) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var lastErr error
+	for nodeID, ps := range m.peers {
 		if ps.conn != nil {
-			_ = ps.conn.Close()
+			if err := ps.conn.WriteMessage(msgType, payload); err != nil {
+				log.Printf("[transport] broadcast to %s failed: %v", nodeID, err)
+				lastErr = err
+			}
 		}
-		delete(m.peers, nodeID)
 	}
+	return lastErr
+}
+
+func (m *Manager) SendTo(nodeID string, msgType MsgType, payload []byte) error {
+	m.mu.RLock()
+	ps, ok := m.peers[nodeID]
+	m.mu.RUnlock()
+	if !ok || ps.conn == nil {
+		return nil
+	}
+	return ps.conn.WriteMessage(msgType, payload)
+}
+
+func (m *Manager) Peers() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	peers := make([]string, 0, len(m.peers))
+	for nodeID := range m.peers {
+		peers = append(peers, nodeID)
+	}
+	return peers
 }
 
 func (m *Manager) Close() {

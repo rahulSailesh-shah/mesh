@@ -11,10 +11,27 @@ import (
 	"time"
 
 	"mesh/internal/discovery"
+	"mesh/internal/election"
 	"mesh/internal/transport"
 )
 
 const defaultPort = 9876
+
+type transportAdapter struct {
+	mgr *transport.Manager
+}
+
+func (t *transportAdapter) Broadcast(msgType transport.MsgType, payload []byte) error {
+	return t.mgr.Broadcast(msgType, payload)
+}
+
+func (t *transportAdapter) Send(nodeID string, msgType transport.MsgType, payload []byte) error {
+	return t.mgr.SendTo(nodeID, msgType, payload)
+}
+
+func (t *transportAdapter) Peers() []string {
+	return t.mgr.Peers()
+}
 
 func main() {
 	port := flag.Int("port", defaultPort, "TCP listen port")
@@ -37,6 +54,26 @@ func main() {
 	manager := transport.NewManager(*nodeID, *port)
 	defer manager.Close()
 
+	elec := election.New(
+		election.DefaultConfig(*nodeID),
+		election.Callbacks{
+			OnLeaderElected: func(leaderID string) {
+				if leaderID == *nodeID {
+					log.Printf("[main] I am now the LEADER")
+				} else {
+					log.Printf("[main] Leader elected: %s", leaderID)
+				}
+			},
+			OnLeaderLost: func() {
+				log.Printf("[main] Lost leadership")
+			},
+		},
+		&transportAdapter{mgr: manager},
+	)
+
+	manager.SetMessageHandler(elec.HandleMessage)
+	manager.SetPeerCallbacks(elec.AddPeer, elec.RemovePeer)
+
 	onPeer := func(peer transport.Peer) {
 		log.Printf("[main] peer discovered: nodeID=%q addr=%s", peer.NodeID, peer.Addr)
 		manager.AddPeer(peer)
@@ -57,7 +94,7 @@ func main() {
 		}
 	}()
 
-	go manager.RunHealthCheck(ctx)
+	go elec.Start(ctx)
 
 	log.Printf("[main] mesh node %q listening on %s", *nodeID, listenAddr)
 	<-ctx.Done()
