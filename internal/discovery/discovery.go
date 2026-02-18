@@ -1,3 +1,4 @@
+// Package discovery uses mDNS/Zeroconf for peer discovery on the local network.
 package discovery
 
 import (
@@ -30,7 +31,6 @@ func New(ourNodeID string, ourPort int, onPeer func(peer transport.Peer)) *Disco
 	}
 }
 
-// Start advertises this node and browses for peers. Blocks until ctx is cancelled.
 func (d *Discovery) Start(ctx context.Context) error {
 	meta := []string{
 		"version=0.1.0",

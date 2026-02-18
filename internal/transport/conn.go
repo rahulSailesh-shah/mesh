@@ -1,3 +1,5 @@
+// Package transport provides TCP-based mesh networking with length-prefixed framing.
+// Wire protocol: [4-byte BE length][1-byte type][payload]
 package transport
 
 import (
@@ -9,9 +11,8 @@ import (
 	"sync"
 )
 
-const maxMessageSize = 4 * 1024 * 1024 // 4 MiB
+const maxMessageSize = 4 * 1024 * 1024
 
-// MsgType identifies the purpose of a message.
 type MsgType byte
 
 const (
@@ -21,26 +22,20 @@ const (
 	MsgData
 )
 
-// Handshake is exchanged immediately after TCP connect.
 type Handshake struct {
 	NodeID     string `json:"node_id"`
 	ListenPort int    `json:"listen_port"`
 }
 
-// Conn wraps a net.Conn with length-prefixed message framing.
-// Protocol: [4-byte length][1-byte type][payload...]
-// The length includes the type byte.
 type Conn struct {
 	net.Conn
 	mu sync.Mutex
 }
 
-// NewConn wraps c with framing.
 func NewConn(c net.Conn) *Conn {
 	return &Conn{Conn: c}
 }
 
-// WriteMessage writes len(payload)+1 as 4-byte big-endian then MsgType then payload.
 func (c *Conn) WriteMessage(t MsgType, payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -60,7 +55,6 @@ func (c *Conn) WriteMessage(t MsgType, payload []byte) error {
 	return nil
 }
 
-// ReadMessage reads 4-byte length followed by type byte and payload.
 func (c *Conn) ReadMessage() (MsgType, []byte, error) {
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(c.Conn, lenBuf); err != nil {
@@ -91,7 +85,6 @@ func (c *Conn) ReadMessage() (MsgType, []byte, error) {
 	return MsgType(typeBuf[0]), buf, nil
 }
 
-// WriteHandshake JSON-encodes h and sends it as a MsgHandshake.
 func (c *Conn) WriteHandshake(h Handshake) error {
 	data, err := json.Marshal(h)
 	if err != nil {
@@ -100,7 +93,6 @@ func (c *Conn) WriteHandshake(h Handshake) error {
 	return c.WriteMessage(MsgHandshake, data)
 }
 
-// ReadHandshake reads one framed message and JSON-decodes it into a Handshake.
 func (c *Conn) ReadHandshake() (Handshake, error) {
 	t, data, err := c.ReadMessage()
 	if err != nil {

@@ -16,10 +16,9 @@ const (
 	maxFailedAttempts  = 3
 )
 
-// Peer identifies a mesh peer (from discovery).
 type Peer struct {
 	NodeID string
-	Addr   string // "host:port"
+	Addr   string
 }
 
 type peerState struct {
@@ -30,11 +29,10 @@ type peerState struct {
 	failedAttempts int
 }
 
-// Manager tracks known peers and connections, and runs the health check loop.
 type Manager struct {
 	ourNodeID     string
 	ourListenPort int
-	peers         map[string]*peerState // keyed by NodeID
+	peers         map[string]*peerState
 	mu            sync.RWMutex
 }
 
@@ -68,7 +66,6 @@ func (m *Manager) getOrCreate(nodeID, addr string) *peerState {
 	return ps
 }
 
-// RegisterIncoming registers an accepted (inbound) connection.
 func (m *Manager) RegisterIncoming(conn *Conn, peerAddr, nodeID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -87,9 +84,13 @@ func (m *Manager) readLoop(nodeID string, c *Conn) {
 	defer func() {
 		log.Printf("read loop ended for %s", nodeID)
 		m.mu.Lock()
-		if ps, ok := m.peers[nodeID]; ok && ps.conn == c {
+		if ps, ok := m.peers[nodeID]; ok {
 			ps.conn = nil
 			_ = c.Close()
+			if m.ourNodeID > nodeID {
+				delete(m.peers, nodeID)
+				log.Printf("evicted peer %s (passive side, connection lost)", nodeID)
+			}
 		}
 		m.mu.Unlock()
 	}()
@@ -136,7 +137,7 @@ func (m *Manager) probePeers() {
 }
 
 func (m *Manager) probeOne(peer Peer) {
-	// Only the lower NodeID dials, preventing duplicate connections.
+	// Lower NodeID dials to prevent duplicate connections between peers.
 	if m.ourNodeID >= peer.NodeID {
 		log.Printf("skipping probe to %s: higher NodeID (ours=%s, theirs=%s)", peer.NodeID, m.ourNodeID, peer.NodeID)
 		return
@@ -152,7 +153,6 @@ func (m *Manager) probeOne(peer Peer) {
 	conn, lastDial, bo := ps.conn, ps.lastDialed, ps.backoff
 	m.mu.RUnlock()
 
-	// Ping the existing connection to detect staleness.
 	if conn != nil {
 		log.Printf("sending ping to %s", peer.NodeID)
 		_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -173,7 +173,6 @@ func (m *Manager) probeOne(peer Peer) {
 		return
 	}
 
-	// Dial if enough time has passed since the last attempt.
 	if time.Since(lastDial) < bo {
 		log.Printf("backing off dial to %s (waited %v, need %v)", peer.NodeID, time.Since(lastDial), bo)
 		return
@@ -196,7 +195,6 @@ func (m *Manager) probeOne(peer Peer) {
 	defer m.mu.Unlock()
 	ps, ok = m.peers[peer.NodeID]
 	if !ok || ps.conn != nil {
-		// Peer evicted or connection raced in — discard.
 		_ = newConn.Close()
 		return
 	}
@@ -207,7 +205,6 @@ func (m *Manager) probeOne(peer Peer) {
 	log.Printf("established outbound connection to %s", peer.NodeID)
 }
 
-// dial performs the TCP dial and handshake, returning a ready Conn.
 func (m *Manager) dial(peer Peer) (*Conn, error) {
 	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	raw, err := dialer.Dial("tcp", peer.Addr)
