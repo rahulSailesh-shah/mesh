@@ -54,7 +54,7 @@ func main() {
 	manager := transport.NewManager(*nodeID, *port)
 	defer manager.Close()
 
-	elec := election.New(
+	elect := election.New(
 		election.DefaultConfig(*nodeID),
 		election.Callbacks{
 			OnLeaderElected: func(leaderID string) {
@@ -71,8 +71,8 @@ func main() {
 		&transportAdapter{mgr: manager},
 	)
 
-	manager.SetMessageHandler(elec.HandleMessage)
-	manager.SetPeerCallbacks(elec.AddPeer, elec.RemovePeer)
+	manager.SetMessageHandler(elect.HandleMessage)
+	manager.SetPeerCallbacks(elect.AddPeer, elect.RemovePeer)
 
 	onPeer := func(peer transport.Peer) {
 		log.Printf("[main] peer discovered: nodeID=%q addr=%s", peer.NodeID, peer.Addr)
@@ -94,7 +94,7 @@ func main() {
 		}
 	}()
 
-	go elec.Start(ctx)
+	go elect.Start(ctx)
 
 	log.Printf("[main] mesh node %q listening on %s", *nodeID, listenAddr)
 	<-ctx.Done()

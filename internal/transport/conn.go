@@ -22,6 +22,7 @@ const (
 	MsgData
 	MsgElection
 	MsgCoordinator
+	MsgOk
 )
 
 type Handshake struct {

@@ -22,7 +22,12 @@ type Heartbeat struct {
 	LeaderID string `json:"leader_id"`
 }
 
-type ElectionMsg struct {
+type Message struct {
+	Term   uint64 `json:"term"`
+	NodeID string `json:"node_id"`
+}
+
+type OkMsg struct {
 	Term   uint64 `json:"term"`
 	NodeID string `json:"node_id"`
 }
@@ -37,13 +42,14 @@ type Election struct {
 	callbacks Callbacks
 	transport Transport
 
-	mu           sync.RWMutex
-	state        State
-	term         uint64
-	leaderID     string
-	peers        map[string]struct{}
-	lastHB       time.Time
-	stopElection chan struct{}
+	mu              sync.RWMutex
+	state           State
+	term            uint64
+	leaderID        string
+	peers           map[string]struct{}
+	lastHB          time.Time
+	receivedOK      bool   // did any higher-priority node respond to our ELECTION?
+	coordinatorFrom string // track who promised to become coordinator
 
 	rand *rand.Rand
 }
@@ -60,23 +66,20 @@ func New(config Config, callbacks Callbacks, transport Transport) *Election {
 	}
 
 	return &Election{
-		config:       config,
-		callbacks:    callbacks,
-		transport:    transport,
-		state:        StateFollower,
-		peers:        make(map[string]struct{}),
-		lastHB:       time.Now(),
-		rand:         rand.New(rand.NewSource(time.Now().UnixNano())),
-		stopElection: make(chan struct{}),
+		config:    config,
+		callbacks: callbacks,
+		transport: transport,
+		state:     StateFollower,
+		peers:     make(map[string]struct{}),
+		lastHB:    time.Now(),
+		rand:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
 func (e *Election) Start(ctx context.Context) error {
 	log.Printf("[election] starting, nodeID=%s", e.config.NodeID)
-
 	go e.leaderMonitor(ctx)
 	go e.heartbeatSender(ctx)
-
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -131,13 +134,23 @@ func (e *Election) HandleMessage(from string, msgType transport.MsgType, payload
 			return
 		}
 		e.handleHeartbeat(from, hb)
+
 	case transport.MsgElection:
-		var em ElectionMsg
+		var em Message
 		if err := json.Unmarshal(payload, &em); err != nil {
 			log.Printf("[election] failed to unmarshal election msg: %v", err)
 			return
 		}
 		e.handleElectionMsg(from, em)
+
+	case transport.MsgOk:
+		var ok OkMsg
+		if err := json.Unmarshal(payload, &ok); err != nil {
+			log.Printf("[election] failed to unmarshal ok msg: %v", err)
+			return
+		}
+		e.handleOkMsg(from, ok)
+
 	case transport.MsgCoordinator:
 		var coord Coordinator
 		if err := json.Unmarshal(payload, &coord); err != nil {
@@ -145,10 +158,10 @@ func (e *Election) HandleMessage(from string, msgType transport.MsgType, payload
 			return
 		}
 		e.handleCoordinator(from, coord)
+
 	default:
 		log.Printf("[election] unknown message type: %v", msgType)
 	}
-
 }
 
 func (e *Election) handleHeartbeat(from string, hb Heartbeat) {
@@ -164,6 +177,7 @@ func (e *Election) handleHeartbeat(from string, hb Heartbeat) {
 		e.term = hb.Term
 	}
 
+	// Another leader heart beating at same term — if it has higher priority, step down
 	if e.state == StateLeader && hb.Term == e.term && hb.LeaderID != e.config.NodeID {
 		if hb.LeaderID > e.config.NodeID {
 			log.Printf("[election] stepping down: higher priority leader %s", hb.LeaderID)
@@ -191,9 +205,10 @@ func (e *Election) handleHeartbeat(from string, hb Heartbeat) {
 	}
 }
 
-func (e *Election) handleElectionMsg(from string, em ElectionMsg) {
+// handleElectionMsg — received ELECTION from a lower-priority node.
+// We must send OK (demoting the sender) and start our own election if not already candidate/leader.
+func (e *Election) handleElectionMsg(from string, em Message) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if em.Term > e.term {
 		e.term = em.Term
@@ -203,18 +218,45 @@ func (e *Election) handleElectionMsg(from string, em ElectionMsg) {
 		}
 	}
 
-	if em.NodeID > e.config.NodeID {
-		log.Printf("[election] received election from higher priority %s, deferring", from)
+	// If the sender has higher priority than us, we are NOT the right responder — ignore.
+	if em.NodeID >= e.config.NodeID {
+		e.mu.Unlock()
 		return
 	}
 
-	go func() {
-		resp := ElectionMsg{Term: e.term, NodeID: e.config.NodeID}
-		data, _ := json.Marshal(resp)
-		if err := e.transport.Send(from, transport.MsgElection, data); err != nil {
-			log.Printf("[election] failed to send election response to %s: %v", from, err)
-		}
-	}()
+	term := e.term
+	shouldStartElection := e.state != StateLeader && e.state != StateCandidate
+	e.mu.Unlock()
+
+	log.Printf("[election] sending OK to lower-priority node %s", from)
+	ok := OkMsg{Term: term, NodeID: e.config.NodeID}
+	data, _ := json.Marshal(ok)
+	if err := e.transport.Send(from, transport.MsgOk, data); err != nil {
+		log.Printf("[election] failed to send OK to %s: %v", from, err)
+	}
+
+	if shouldStartElection {
+		go e.startElection()
+	}
+}
+
+// handleOkMsg — a higher-priority node told us to back off.
+func (e *Election) handleOkMsg(from string, ok OkMsg) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if ok.Term < e.term {
+		return
+	}
+	if ok.Term > e.term {
+		e.term = ok.Term
+	}
+
+	if e.state == StateCandidate {
+		log.Printf("[election] received OK from higher-priority node %s, stepping back", from)
+		e.receivedOK = true
+		e.coordinatorFrom = from
+	}
 }
 
 func (e *Election) handleCoordinator(from string, coord Coordinator) {
@@ -235,6 +277,8 @@ func (e *Election) handleCoordinator(from string, coord Coordinator) {
 
 	e.leaderID = coord.LeaderID
 	e.state = StateFollower
+	e.receivedOK = false
+	e.coordinatorFrom = ""
 	e.lastHB = time.Now()
 
 	if oldState == StateLeader && oldLeader == e.config.NodeID && e.callbacks.OnLeaderLost != nil {
@@ -252,6 +296,8 @@ func (e *Election) handleCoordinator(from string, coord Coordinator) {
 func (e *Election) stepDownLocked(newLeader string) {
 	wasLeader := e.state == StateLeader
 	e.state = StateFollower
+	e.receivedOK = false
+	e.coordinatorFrom = ""
 	if newLeader != "" {
 		e.leaderID = newLeader
 	}
@@ -286,7 +332,7 @@ func (e *Election) checkLeaderTimeout() {
 
 	if time.Since(lastHB) > e.config.HeartbeatTimeout {
 		log.Printf("[election] leader timeout (last heartbeat %v ago)", time.Since(lastHB))
-		e.startElection()
+		go e.startElection()
 	}
 }
 
@@ -295,58 +341,101 @@ func (e *Election) startElection() {
 	time.Sleep(jitter)
 
 	e.mu.Lock()
-	if e.state == StateLeader {
+	if e.state == StateLeader || e.state == StateCandidate {
 		e.mu.Unlock()
 		return
 	}
 
 	e.term++
 	e.state = StateCandidate
+	e.receivedOK = false
+	e.coordinatorFrom = ""
 	currentTerm := e.term
-	peers := make([]string, 0, len(e.peers))
+
+	higherPeers := make([]string, 0)
 	for p := range e.peers {
-		peers = append(peers, p)
+		if p > e.config.NodeID {
+			higherPeers = append(higherPeers, p)
+		}
 	}
 	e.mu.Unlock()
 
-	log.Printf("[election] starting election, term=%d, peers=%d", currentTerm, len(peers))
+	log.Printf("[election] starting election, term=%d, higher-priority peers=%d", currentTerm, len(higherPeers))
 
-	em := ElectionMsg{Term: currentTerm, NodeID: e.config.NodeID}
-	data, _ := json.Marshal(em)
-	_ = e.transport.Broadcast(transport.MsgElection, data)
-
-	time.Sleep(e.config.ElectionTimeout)
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.state != StateCandidate {
-		log.Printf("[election] no longer candidate, state=%s", e.state)
+	if len(higherPeers) == 0 {
+		// No higher-priority nodes — we win immediately
+		e.declareVictory(currentTerm)
 		return
 	}
 
-	higherPriority := false
-	for p := range e.peers {
-		if p > e.config.NodeID {
-			higherPriority = true
-			break
+	em := Message{Term: currentTerm, NodeID: e.config.NodeID}
+	data, _ := json.Marshal(em)
+	for _, p := range higherPeers {
+		if err := e.transport.Send(p, transport.MsgElection, data); err != nil {
+			log.Printf("[election] failed to send ELECTION to %s: %v", p, err)
 		}
 	}
 
-	if !higherPriority {
-		log.Printf("[election] becoming leader, term=%d", e.term)
-		e.state = StateLeader
-		e.leaderID = e.config.NodeID
-		if e.callbacks.OnLeaderElected != nil {
-			go e.callbacks.OnLeaderElected(e.config.NodeID)
-		}
+	// Wait for OK responses
+	time.Sleep(e.config.ElectionTimeout)
 
-		coord := Coordinator{Term: e.term, LeaderID: e.config.NodeID}
-		coordData, _ := json.Marshal(coord)
-		go e.transport.Broadcast(transport.MsgCoordinator, coordData)
+	e.mu.Lock()
+	if e.state != StateCandidate {
+		e.mu.Unlock()
+		return
+	}
+	gotOK := e.receivedOK
+	e.mu.Unlock()
+
+	if gotOK {
+		// A higher-priority node is alive and will take over.
+		// Wait for COORDINATOR; if it doesn't arrive, restart election.
+		log.Printf("[election] received OK, waiting for COORDINATOR")
+		e.waitForCoordinator(currentTerm)
 	} else {
-		log.Printf("[election] higher priority peers exist, waiting")
+		// No higher-priority node responded — we are the highest alive node
+		e.declareVictory(currentTerm)
 	}
+}
+
+func (e *Election) declareVictory(term uint64) {
+	e.mu.Lock()
+	if e.state != StateCandidate || e.term != term {
+		e.mu.Unlock()
+		return
+	}
+
+	log.Printf("[election] becoming leader, term=%d", e.term)
+	e.state = StateLeader
+	e.leaderID = e.config.NodeID
+	e.receivedOK = false
+	e.coordinatorFrom = ""
+	e.mu.Unlock()
+
+	if e.callbacks.OnLeaderElected != nil {
+		go e.callbacks.OnLeaderElected(e.config.NodeID)
+	}
+
+	coord := Coordinator{Term: term, LeaderID: e.config.NodeID}
+	coordData, _ := json.Marshal(coord)
+	go e.transport.Broadcast(transport.MsgCoordinator, coordData)
+}
+
+// waitForCoordinator waits after receiving OK. If COORDINATOR doesn't arrive
+// within the timeout, restart the election (the higher-priority node may have crashed too).
+func (e *Election) waitForCoordinator(term uint64) {
+	time.Sleep(e.config.ElectionTimeout * 2)
+
+	e.mu.Lock()
+	if e.state != StateCandidate || e.term != term {
+		// Either we got the COORDINATOR (now follower) or something else happened
+		e.mu.Unlock()
+		return
+	}
+	e.mu.Unlock()
+
+	log.Printf("[election] no COORDINATOR received after OK, restarting election")
+	go e.startElection()
 }
 
 func (e *Election) heartbeatSender(ctx context.Context) {

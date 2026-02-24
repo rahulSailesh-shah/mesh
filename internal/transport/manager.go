@@ -168,7 +168,7 @@ func (m *Manager) readLoop(nodeID string, c *Conn) {
 			if m.onMessage != nil {
 				m.onMessage(nodeID, t, payload)
 			}
-		case MsgElection, MsgCoordinator:
+		case MsgElection, MsgOk, MsgCoordinator:
 			if m.onMessage != nil {
 				m.onMessage(nodeID, t, payload)
 			}
